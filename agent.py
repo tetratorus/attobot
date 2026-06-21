@@ -444,7 +444,7 @@ def start_triggers():
     triggers_dir.mkdir(parents=True, exist_ok=True)
     heartbeat = triggers_dir / "heartbeat.json"
     if not heartbeat.exists():
-        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "tick"}))
+        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "Check your latest state to see if there's work, and then pick something worthwhile to do. If there is genuinely nothing to do, reply immediately to this trigger with a simple text message; the harness will interpret this as an idle and backoff the heartbeat interval."}))
 
     def loop():
         while True:
@@ -476,7 +476,7 @@ def start_triggers():
                             job["next"] = ts + job["repeat_s"]
                         f.write_text(json.dumps(job))
                     content = f"[trigger {f.stem}] {msg}"
-                    if f.stem.startswith("subconscious-"):  # subc has no channel of its own; surface its triggers to Telegram via the primary
+                    if f.stem.startswith("subconscious-"):  # subconscious has no channel of its own; surface its triggers to Telegram via the primary
                         send_text(content)
                     with _trigger_queue_lock:
                         _trigger_queue.append({"role": "user", "content": f"<system-message>{content}</system-message>"})
