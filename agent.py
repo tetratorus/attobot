@@ -641,8 +641,7 @@ def main():
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
         msg = llm_w_retry(
-            # Ensure ≥1 user message
-            [{"role": "system", "content": system}] + [{"role": "user", "content": "Be Useful"}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
+            [{"role": "system", "content": system}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
             tools=TOOL_SCHEMAS)
         assistant = {"role": "assistant", "content": msg.get("content") or "",
                      **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
