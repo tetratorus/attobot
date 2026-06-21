@@ -443,7 +443,7 @@ def start_triggers():
     triggers_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     triggers_dir.mkdir(parents=True, exist_ok=True)
     heartbeat = triggers_dir / "heartbeat.json"
-    if not heartbeat.exists():
+    if not heartbeat.exists() and os.path.basename(os.path.abspath(AGENT_DIR)) != "subconscious":
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "Check your latest state to see if there's work, and then pick something worthwhile to do. If there is genuinely nothing to do, reply immediately to this trigger with a simple text message; the harness will interpret this as an idle and backoff the heartbeat interval."}))
 
     def loop():
