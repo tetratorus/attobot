@@ -671,7 +671,7 @@ def main():
             f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
             try:
                 job = json.loads(f.read_text())
-                if did_tool_call:
+                if did_tool_call and not _unwrap_sys_msg(inbound.get("content", "")).startswith("[trigger heartbeat]"):
                     job["idles"] = 0
                     job["next"] = time.time() + job["repeat_s"]
                 else:
