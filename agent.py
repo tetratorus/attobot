@@ -12,7 +12,7 @@ CFG = { # defaults
     "telegram_api_base": "https://api.telegram.org",
     "temperature": 1.0,
     "reasoning_effort": "medium",
-    "context_tokens": 1000000,
+    "context_tokens": 100000,
     "multimodal_support": False,
     "provider": "",
     "opt": [],
