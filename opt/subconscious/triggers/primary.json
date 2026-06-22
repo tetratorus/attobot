@@ -1,1 +1,1 @@
-{"watch": "agent/messages.jsonl", "repeat_s": 450, "cmd": "L=subconscious/.primary_snap; [ -f \"$L\" ] || { cp agent/messages.jsonl \"$L\"; exit 0; }; diff \"$L\" agent/messages.jsonl | grep '^>' | sed 's/^> //'; cp agent/messages.jsonl \"$L\""}
+{"watch": "agent/messages.jsonl", "repeat_s": 450, "cmd": "L=subconscious/.primary_snap; [ -f \"$L\" ] || { cp agent/messages.jsonl \"$L\"; exit 0; }; diff \"$L\" agent/messages.jsonl | grep '^>' | sed 's/^> //' | awk '{a[NR]=$0} END{ if(NR>10) for(i=1;i<=NR;i++) print a[i] }'; cp agent/messages.jsonl \"$L\""}
