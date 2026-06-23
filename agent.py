@@ -347,7 +347,10 @@ def bg_run(name, args, tool_call_id, tool_fn):
     }))
 
     def emit():
-        t.join()
+        try:
+            if holder.get("pid"): os.kill(holder["pid"], 9)
+        except Exception: pass
+        t.join(5)
         append_msg({"role": "user", "content": f"<system-message>[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}</system-message>"})
         try: json_path.unlink()
         except Exception: pass
@@ -553,7 +556,7 @@ def _exec_stash_directive(arg):
 
 def build_system():
     soul = open(f"{AGENT_DIR}/SOUL.md").read()
-    harness = open(__file__).read()
+    harness = globals().get("_HARNESS_SRC") or (globals().update(_HARNESS_SRC=open(__file__).read()) or globals()["_HARNESS_SRC"])
     memory = open(f"{AGENT_DIR}/MEMORY.md").read()
     if len(memory) > CFG["memory_limit"]:
         h = CFG["memory_limit"] // 2
