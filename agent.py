@@ -644,7 +644,7 @@ def main():
             [{"role": "system", "content": system}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
             tools=TOOL_SCHEMAS)
         assistant = {"role": "assistant", "content": msg.get("content") or "",
-                     **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
+                     **{k: msg[k] for k in (["reasoning_content", "tool_calls"] if CFG.get("provider") in ("qwen", "kimi") else ["tool_calls"]) if msg.get(k)}}
         owe_turn = False
 
         i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") == "user"), (None, {}))
