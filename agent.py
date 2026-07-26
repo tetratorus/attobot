@@ -115,7 +115,7 @@ def _default_chat(messages, tools):
         body["tools"] = tools
     r = requests.post(f"{CFG['api_base']}/chat/completions",
         headers={"Authorization": f"Bearer {CFG['api_key']}"},
-        json=body, timeout=120)
+        json=body, timeout=600)  # long reasoning generations exceed 120s; timing out mid-generation = retry forever
     data = r.json()
     if "choices" not in data:
         if 400 <= r.status_code < 500 and r.status_code != 429:
@@ -137,7 +137,7 @@ def llm_w_retry(messages, tools=None):
 
 _TG_MEDIA = {ext: (f"send{kind}", kind.lower()) for kind, exts in {"Photo": "jpg jpeg png gif webp", "Video": "mp4 mov webm", "Voice": "ogg", "Audio": "mp3 m4a wav"}.items() for ext in exts.split()}
 
-def _tg_send(endpoint, payload, files=None, cfg=None):
+def _tg_send(endpoint, payload, files=None, cfg=None, quiet=False):
     cfg = cfg or CFG
     payload = {"chat_id": cfg["telegram_chat_id"], **payload}
     if cfg.get("telegram_thread_id"):
@@ -147,15 +147,20 @@ def _tg_send(endpoint, payload, files=None, cfg=None):
                       data=payload, files=files, timeout=60)
     data = r.json()
     if not data.get("ok"):
-        life(f"[telegram send error] {data}")
+        if not quiet:
+            life(f"[telegram send error] {data}")
         return f"telegram error: {data.get('description', data)}"
     return None
+
+def _send_md(chunk):  # telegram renders legacy Markdown itself; unbalanced */_/` -> resend plain
+    # md attempt is quiet: a parse rejection is expected, not an error — only the fallback's failure is real
+    return _tg_send("sendMessage", {"text": chunk, "parse_mode": "Markdown"}, quiet=True) and _tg_send("sendMessage", {"text": chunk})
 
 def send_text(text):
     if not CFG.get("telegram_token"):
         return "no chat configured"
     errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
-              if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
+              if (err := _send_md(text[i:i+CFG['chat_msg_max']]))]
     return errors[0] if errors else "sent"
 
 def send_attachment(args):
@@ -258,7 +263,7 @@ def stash_messages(args):
             None,
         )
         summary = (response.get("content") or "").strip()
-    except Exception as exc:
+    except BaseException as exc:  # incl. SystemExit from a fatal 4xx — a failed summary must never abort the stash
         summary = f"(summary failed: {exc})"
     marker = stash(target)
     count = e - s
@@ -347,10 +352,7 @@ def bg_run(name, args, tool_call_id, tool_fn):
     }))
 
     def emit():
-        try:
-            if holder.get("pid"): os.kill(holder["pid"], 9)
-        except Exception: pass
-        t.join(5)
+        t.join()  # run to completion; the bg json holds the pid if the agent wants it dead sooner
         append_msg({"role": "user", "content": f"<system-message>[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}</system-message>"})
         try: json_path.unlink()
         except Exception: pass
@@ -643,9 +645,19 @@ def main():
             append_msg({"role": "user", "content": f"<system-message>[stash_messages] {stash_messages({})}</system-message>"})
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
-        msg = llm_w_retry(
-            [{"role": "system", "content": system}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
-            tools=TOOL_SCHEMAS)
+        try:
+            msg = llm_w_retry(
+                [{"role": "system", "content": system}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
+                tools=TOOL_SCHEMAS)
+        except SystemExit as e:
+            # a context-window 4xx would otherwise crash-loop forever under Restart=always
+            # (the char-estimate overflow check never trips when config context_tokens > the model's real window)
+            r = stash_messages({}) if any(k in str(e).lower() for k in ("context", "too long", "exceed")) else ""
+            if not r[:1].isdigit():  # "N lines stashed …" = progress; anything else, die as before
+                raise
+            append_msg({"role": "user", "content": f"<system-message>[emergency stash after fatal llm error] {r}</system-message>"})
+            last_hash = ""
+            continue
         assistant = {"role": "assistant", "content": msg.get("content") or "",
                      **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
         owe_turn = False
@@ -653,12 +665,12 @@ def main():
         i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") == "user"), (None, {}))
         tail = messages[i + 1:] if i is not None else messages
         did_tool_call = bool(assistant.get("tool_calls")) or any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
+        tool_results = []
         if not assistant.get("tool_calls"):
             append_msg(assistant)
             if not SYS_MSG.fullmatch(inbound.get("content") or "") or did_tool_call:
                 if text := (assistant.get("content") or "").strip(): send_text(text)
         else:
-            tool_results = []
             for tc in assistant["tool_calls"]:
                 name = tc["function"]["name"]
                 try:
@@ -674,7 +686,7 @@ def main():
             f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
             try:
                 job = json.loads(f.read_text())
-                if did_tool_call and not _unwrap_sys_msg(inbound.get("content", "")).startswith("[trigger heartbeat]"):
+                if did_tool_call:  # real work resets cadence — even work a heartbeat prompted
                     job["idles"] = 0
                     job["next"] = time.time() + job["repeat_s"]
                 else:
@@ -685,9 +697,20 @@ def main():
                 pass
 
         last_hash = file_hash()
+        # anything appended mid-turn (telegram/bg/mail landed during the llm call or send) is inside
+        # last_hash but wasn't in this turn's input — detect it or it would never get a turn
+        if not owe_turn and load_messages() != messages + [assistant] + tool_results:
+            owe_turn = True
         _flush_trigger_over_idle()
+
+def _respawn(extra):  # a crashed sibling (e.g. subconscious) must not stay silently dead
+    while True:
+        p = subprocess.Popen([sys.executable, __file__, extra])
+        p.wait()
+        life(f"[child {extra} exited {p.returncode}; respawn in 10s]")
+        time.sleep(10)
 
 if __name__ == "__main__":
     for extra in sys.argv[2:]:  # extra agent dirs each get their own process
-        subprocess.Popen([sys.executable, __file__, extra])
+        threading.Thread(target=_respawn, args=(extra,), daemon=True, name=f"respawn-{extra}").start()
     main()

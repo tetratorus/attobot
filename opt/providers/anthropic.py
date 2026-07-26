@@ -41,7 +41,7 @@ def chat(messages, tools):
             "content-type": "application/json",
         },
         json=body,
-        timeout=120,
+        timeout=600,  # long reasoning generations exceed 120s; timing out mid-generation = retry forever
     )
     data = r.json()
     if "content" not in data:
