@@ -21,7 +21,8 @@ def run(args):
     if not name.startswith("subconscious-"):
         name = "subconscious-" + name
     spec = {"message": args["message"], "next": 0}
-    tdir = pathlib.Path(agent.AGENT_DIR).resolve().parent / "agent" / "triggers"
+    primary = pathlib.Path(agent.CFG.get("primary_dir", pathlib.Path(agent.AGENT_DIR).resolve().parent / "agent"))
+    tdir = primary / "triggers"
     tdir.mkdir(parents=True, exist_ok=True)
     (tdir / f"{name}.json").write_text(json.dumps(spec))
-    return f"created agent/triggers/{name}.json"
+    return f"created {tdir / f'{name}.json'}"

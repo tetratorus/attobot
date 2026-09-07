@@ -26,8 +26,9 @@ def run(args):
     if start < 1 or end < start:
         return "error: start must be >= 1 and end >= start"
     spec = {"message": f"STASH_MESSAGE: {start} {end}", "next": 0}
-    tdir = pathlib.Path(agent.AGENT_DIR).resolve().parent / "agent" / "triggers"
+    primary = pathlib.Path(agent.CFG.get("primary_dir", pathlib.Path(agent.AGENT_DIR).resolve().parent / "agent"))
+    tdir = primary / "triggers"
     tdir.mkdir(parents=True, exist_ok=True)
     name = "subconscious-stash"
     (tdir / f"{name}.json").write_text(json.dumps(spec))
-    return f"created agent/triggers/{name}.json — will stash lines {start}-{end} on next tick"
+    return f"created {tdir / f'{name}.json'} — will stash lines {start}-{end} on next tick"

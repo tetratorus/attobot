@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, re, requests, shutil, subprocess, sys, threading, time
+import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, re, requests, shutil, signal, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
@@ -26,8 +26,9 @@ CFG = { # defaults
     "tool_output_limit": 5000,
 }
 
-os.makedirs(BLOB_DIR, exist_ok=True)
-os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
+_shutdown = threading.Event()
+_children = set()
+_children_lock = threading.Lock()
 
 SYS_MSG = re.compile(r"<system-message>.*</system-message>", re.DOTALL)
 
@@ -39,6 +40,9 @@ def _unwrap_sys_msg(content):
 def life(event, agent_dir=AGENT_DIR):
     if not isinstance(event, str):
         event = repr(event)
+    for key in ("api_key", "telegram_token"):
+        if secret := CFG.get(key):
+            event = event.replace(str(secret), "[redacted]")
     event = event.replace("\n", "\\n")
     if len(event) > 200:
         event = f"{event[:100]}…{event[-100:]}"
@@ -72,9 +76,15 @@ def load_messages(): # Loads and heals messages.jsonl by dropping malformed line
             j = i + 1
             while j < len(msgs) and msgs[j].get("role") == "tool":
                 j += 1
-            need = [tc.get("id") for tc in m["tool_calls"]]
+            calls = m["tool_calls"]
+            valid = isinstance(calls, list) and all(
+                isinstance(tc, dict) and isinstance(tc.get("id"), str) and tc["id"]
+                and isinstance(tc.get("function"), dict)
+                and isinstance(tc["function"].get("name"), str)
+                and isinstance(tc["function"].get("arguments"), str) for tc in calls)
+            need = [tc["id"] for tc in calls] if valid else []
             got = [t.get("tool_call_id") for t in msgs[i + 1:j]]
-            if need and all(cid in got for cid in need):
+            if need and len(set(need)) == len(need) and len(got) == len(need) and all(cid in got for cid in need):
                 out.extend(msgs[i:j])
             i = j
         f.seek(0); f.truncate()
@@ -103,10 +113,36 @@ def append_msg(m, agent_dir=AGENT_DIR):
     for msg in msgs:
         life(_msg_summary(msg), agent_dir)
 
+class FatalLLMError(SystemExit):
+    def __init__(self, status, data):
+        super().__init__(78)
+        self.detail = f"fatal llm error {status}: {data}"
+        text = str(data).lower()
+        self.context_error = status in (400, 413, 422) and any(k in text for k in (
+            "context_length_exceeded", "context window", "context length", "maximum context",
+            "prompt is too long", "input is too long", "too many tokens"))
+
+    def __str__(self):
+        return self.detail
+
+
+def llm_response(response):
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"error": "non-JSON response"}
+    status = response.status_code
+    if 400 <= status < 500 and status not in (408, 409, 429):
+        raise FatalLLMError(status, data)
+    if not 200 <= status < 300 or not isinstance(data, dict):
+        raise RuntimeError(f"llm error {status}: {data}")
+    return data
+
+
 def _default_chat(messages, tools):
     body = {
         "model": CFG["model"],
-        "messages": messages,
+        "messages": [{k: v for k, v in message.items() if k != "provider_state"} for message in messages],
         "temperature": CFG["temperature"],
     }
     if CFG["reasoning_effort"]:
@@ -116,10 +152,8 @@ def _default_chat(messages, tools):
     r = requests.post(f"{CFG['api_base']}/chat/completions",
         headers={"Authorization": f"Bearer {CFG['api_key']}"},
         json=body, timeout=600)  # long reasoning generations exceed 120s; timing out mid-generation = retry forever
-    data = r.json()
-    if "choices" not in data:
-        if 400 <= r.status_code < 500 and r.status_code != 429:
-            sys.exit(f"fatal llm error {r.status_code}: {data}")
+    data = llm_response(r)
+    if not data.get("choices"):
         raise RuntimeError(f"{r.status_code}: {data}")
     return data["choices"][0]["message"]
 
@@ -131,7 +165,7 @@ def llm_w_retry(messages, tools=None):
         try:
             return llm(messages, tools)
         except Exception as e:
-            append_msg({"role": "user", "content": f"<system-message>[llm retry in {delay}s] {e}</system-message>"})
+            life(f"[llm retry in {delay}s] {e}")
             time.sleep(delay)
             delay = min(delay * 2, 900)
 
@@ -177,7 +211,7 @@ def send_attachment(args):
 
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
-    open(f"{BLOB_DIR}/{h}", "w").write(content)
+    pathlib.Path(f"{BLOB_DIR}/{h}").write_text(content)
     return f"[stash {h}]"
 
 def clip(s):
@@ -211,7 +245,7 @@ def edit_file(args):
     return f"edited {path}" + (f" ({count} replacements)" if args.get("replace_all") else "")
 
 def bash(args):
-    return subprocess.Popen(args["cmd"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.Popen(args["cmd"], shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 def search(args):
     from ddgs import DDGS
@@ -225,8 +259,6 @@ def search(args):
 def web_fetch(args):
     from markdownify import markdownify
     url = args["url"]
-    if url.startswith("http://"):
-        url = "https://" + url[7:]
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r.raise_for_status()
@@ -263,19 +295,26 @@ def stash_messages(args):
             None,
         )
         summary = (response.get("content") or "").strip()
-    except BaseException as exc:  # incl. SystemExit from a fatal 4xx — a failed summary must never abort the stash
-        summary = f"(summary failed: {exc})"
+    except (Exception, SystemExit) as exc:  # incl. SystemExit from a fatal 4xx — a failed summary must never abort the stash
+        if _shutdown.is_set():
+            raise
+        life(f"[stash summary failed] {exc}")
+        summary = "(summary unavailable)"
     marker = stash(target)
     count = e - s
     placeholder = json.dumps({"role": "user", "content": f"<system-message>\n{count} lines stashed to {marker}. \nsummary: {summary}</system-message>"})
+    if len(placeholder) >= len(target):
+        placeholder = json.dumps({"role": "user", "content": f"<system-message>{count} lines stashed to {marker}</system-message>"})
+    if len(placeholder) >= len(target):
+        return "nothing safe to stash: replacement would not reduce context"
 
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        content = f.read()
-        if target not in content:
+        current = f.read().splitlines()
+        if current[:n] != lines:
             return "stash failed because target range no longer in file (file was modified)"
         f.seek(0); f.truncate()
-        f.write(content.replace(target, placeholder, 1))
+        f.write("\n".join(current[:s] + [placeholder] + current[e:]) + "\n")
     return f"{count} lines stashed to {marker}"
 
 TOOLS = [
@@ -366,8 +405,8 @@ def bg_run(name, args, tool_call_id, tool_fn):
 def start_chat():
     token = CFG["telegram_token"]
     base = CFG.get("telegram_api_base", "https://api.telegram.org")
-    locked_cid = CFG["telegram_chat_id"]
-    locked_tid = CFG.get("telegram_thread_id")
+    locked_cid = str(CFG["telegram_chat_id"])
+    locked_tid = str(CFG["telegram_thread_id"]) if CFG.get("telegram_thread_id") is not None else None
     poll_offset = pathlib.Path(f"{AGENT_DIR}/tg_poll.offset")
 
     def poll_in():
@@ -377,14 +416,20 @@ def start_chat():
             try:
                 r = requests.post(f"{base}/bot{token}/getUpdates",
                                   data={"offset": offset, "timeout": 25}, timeout=45)
-                updates = r.json().get("result") or []
+                data = r.json()
+                if not data.get("ok"):
+                    raise RuntimeError(f"getUpdates failed: {data}")
+                updates = data.get("result") or []
                 for u in updates:
-                    offset = u["update_id"] + 1
+                    if u["update_id"] < offset:
+                        continue
                     msg = u.get("message") or {}
                     msg_cid = str((msg.get("chat") or {}).get("id") or "")
                     tid_raw = msg.get("message_thread_id")
                     msg_tid = str(tid_raw) if tid_raw is not None else None
                     if msg_cid != locked_cid or msg_tid != locked_tid:
+                        offset = u["update_id"] + 1
+                        poll_offset.write_text(str(offset))
                         continue  # not our chat/topic — drop silently (no bus, no LIFE)
                     if msg.get("photo"):
                         file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
@@ -395,24 +440,25 @@ def start_chat():
                         meta = requests.get(f"{base}/bot{token}/getFile",
                                             params={"file_id": file_id}, timeout=30).json()
                         rel = meta["result"]["file_path"]
-                        blob = requests.get(f"{base}/file/bot{token}/{rel}", timeout=60).content
+                        download = requests.get(f"{base}/file/bot{token}/{rel}", timeout=60)
+                        download.raise_for_status()
+                        blob = download.content
                         inbound = pathlib.Path(f"{AGENT_DIR}/inbound")
                         inbound.mkdir(parents=True, exist_ok=True)
                         save = inbound / f"{u['update_id']}_{rel.rsplit('/', 1)[-1]}"
                         save.write_bytes(blob)
                         caption = msg.get("caption") or ""
                         body = f"(file: {save})" + (f" {caption}" if caption else "")
-                    if not body:
-                        continue
-                    append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
+                    if body:
+                        append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
+                    offset = u["update_id"] + 1
+                    poll_offset.write_text(str(offset))
                     if mid := msg.get("message_id"):
                         try:
                             requests.post(f"{base}/bot{token}/setMessageReaction",
                                 json={"chat_id": locked_cid, "message_id": mid,
                                       "reaction": [{"type":"emoji","emoji":"👀"}]}, timeout=10)
                         except Exception: pass
-                if updates:
-                    poll_offset.write_text(str(offset))
             except Exception as e:
                 life(f"[chat error] {e}")  # transient channel hiccup — log only, don't wake
                 time.sleep(5)
@@ -467,7 +513,7 @@ def start_triggers():
                     msg = job.get("message", "")
                     if c := job.get("cmd"):  # computed condition: fire with stdout; no output = no fire
                         try:
-                            msg = clip(subprocess.run(c, shell=True, capture_output=True, text=True,
+                            msg = clip(subprocess.run(c, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                                       timeout=60).stdout.strip())
                         except Exception as e:
                             msg = f"(cmd error: {e})"
@@ -557,14 +603,14 @@ def _exec_stash_directive(arg):
 # ---------- main loop ----------
 
 def build_system():
-    soul = open(f"{AGENT_DIR}/SOUL.md").read()
-    harness = globals().get("_HARNESS_SRC") or (globals().update(_HARNESS_SRC=open(__file__).read()) or globals()["_HARNESS_SRC"])
-    memory = open(f"{AGENT_DIR}/MEMORY.md").read()
+    soul = pathlib.Path(f"{AGENT_DIR}/SOUL.md").read_text()
+    harness = globals().get("_HARNESS_SRC") or (globals().update(_HARNESS_SRC=pathlib.Path(__file__).read_text()) or globals()["_HARNESS_SRC"])
+    memory = pathlib.Path(f"{AGENT_DIR}/MEMORY.md").read_text()
     if len(memory) > CFG["memory_limit"]:
         h = CFG["memory_limit"] // 2
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted. Move detail into agent/memory/<name>.md files and keep one-line pointers here.]"
     sub = ""
-    if AGENT_DIR != "subconscious" and os.path.isdir("subconscious"):
+    if pathlib.Path(AGENT_DIR).resolve().name != "subconscious" and (pathlib.Path(AGENT_DIR).resolve().parent / "subconscious").is_dir():
         sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream and generates helpful system messages.</subconscious>\n\n")
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
@@ -584,19 +630,35 @@ def life_block():
     return (f"<life>\n[harness] the tail of your own LIFE.md, an append-only timestamped log of your history - captures context that may have been lost due to edits to your context window.\n"
             f"[{earlier} bytes earlier]\n{tail}</life>")
 
+def fatal(message):
+    life(message)
+    print(message, file=sys.stderr)
+    sys.exit(78)
+
+
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
     if not config_path.exists():
-        sys.exit(f"missing {config_path}. Run: python setup.py")
+        fatal(f"missing {config_path}. Run: python setup.py")
     if not pathlib.Path(f"{AGENT_DIR}/SOUL.md").exists():
-        sys.exit(f"missing {AGENT_DIR}/SOUL.md — copy a soul template in")
-    CFG.update(json.loads(config_path.read_text()))
+        fatal(f"missing {AGENT_DIR}/SOUL.md — copy a soul template in")
+    try:
+        config = json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        fatal(f"{config_path} must contain valid JSON")
+    if not isinstance(config, dict):
+        fatal(f"{config_path} must contain an object")
+    CFG.update(config)
+    CFG["api_key"] = os.environ.get("ATTOBOT_API_KEY") or CFG.get("api_key")
     if not CFG.get("api_key"):
-        sys.exit(f"{config_path} missing required field: api_key")
+        fatal(f"{config_path} missing api_key; set ATTOBOT_API_KEY or configure api_key")
     if CFG.get("telegram_token") and not CFG.get("telegram_chat_id"):
-        sys.exit(f"{config_path} has telegram_token but no telegram_chat_id")
-    if not CFG["multimodal_support"] and "tools/ocr_image" not in CFG["opt"]:
-        CFG["opt"].append("tools/ocr_image")
+        fatal(f"{config_path} has telegram_token but no telegram_chat_id")
+    if not isinstance(CFG["opt"], list) or not all(isinstance(entry, str) for entry in CFG["opt"]):
+        fatal(f"{config_path} opt must be a list of paths")
+    if not CFG.get("telegram_token"):
+        TOOL_FNS.pop("SEND_ATTACHMENT", None)
+        TOOL_SCHEMAS[:] = [tool for tool in TOOL_SCHEMAS if tool["function"]["name"] != "SEND_ATTACHMENT"]
     if CFG["provider"] and f"providers/{CFG['provider']}" not in CFG["opt"]:
         CFG["opt"].append(f"providers/{CFG['provider']}")
     for entry in CFG["opt"]:
@@ -608,9 +670,15 @@ def main():
     load_agent_tools()
     if CFG["provider"]:
         global llm
-        llm = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
+        try:
+            llm = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
+        except Exception as e:
+            life(f"[provider load failed] {e}")
+            fatal("configured provider could not be loaded; check LIFE.md")
     pathlib.Path(f"{AGENT_DIR}/MEMORY.md").touch(exist_ok=True)
     pathlib.Path(f"{AGENT_DIR}/messages.jsonl").touch(exist_ok=True)
+    for extra in sys.argv[2:]:  # extra agent dirs each get their own process
+        threading.Thread(target=_respawn, args=(extra,), daemon=True, name=f"respawn-{extra}").start()
     if CFG.get("telegram_token"):  # no token → no chat channel; agent wakes on triggers/mail only
         start_chat()
     start_triggers()
@@ -618,7 +686,7 @@ def main():
     append_msg({"role": "user", "content": f"<system-message>[start] multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}</system-message>"})
 
     def file_hash():
-        return hashlib.sha256(open(f"{AGENT_DIR}/messages.jsonl", "rb").read()).hexdigest()
+        return hashlib.sha256(pathlib.Path(f"{AGENT_DIR}/messages.jsonl").read_bytes()).hexdigest()
 
     last_hash = ""  # force a first turn on startup
     owe_turn = False
@@ -642,7 +710,7 @@ def main():
 
         system, life_tail, messages = build_system(), life_block(), load_messages()
         if len(system) + len(life_tail) + sum(len(json.dumps(m)) for m in messages) > (CFG["context_tokens"] * 4 * 0.8): # ≈4 chars/token, 20% buffer
-            append_msg({"role": "user", "content": f"<system-message>[stash_messages] {stash_messages({})}</system-message>"})
+            life(f"[stash_messages] {stash_messages({})}")
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
         try:
@@ -652,14 +720,19 @@ def main():
         except SystemExit as e:
             # a context-window 4xx would otherwise crash-loop forever under Restart=always
             # (the char-estimate overflow check never trips when config context_tokens > the model's real window)
-            r = stash_messages({}) if any(k in str(e).lower() for k in ("context", "too long", "exceed")) else ""
-            if not r[:1].isdigit():  # "N lines stashed …" = progress; anything else, die as before
+            if _shutdown.is_set():
                 raise
-            append_msg({"role": "user", "content": f"<system-message>[emergency stash after fatal llm error] {r}</system-message>"})
+            life(str(e))
+            legacy = re.match(r"fatal llm error (\d+):", str(e))
+            context_error = getattr(e, "context_error", False) or bool(legacy and FatalLLMError(int(legacy[1]), str(e)).context_error)
+            r = stash_messages({}) if context_error else ""
+            if not r[:1].isdigit():  # "N lines stashed …" = progress; anything else, die as before
+                sys.exit(78)
+            life(f"[emergency stash after fatal llm error] {r}")
             last_hash = ""
             continue
         assistant = {"role": "assistant", "content": msg.get("content") or "",
-                     **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
+                     **{k: msg[k] for k in ("reasoning_content", "tool_calls", "provider_state") if msg.get(k)}}
         owe_turn = False
 
         i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") == "user"), (None, {}))
@@ -704,13 +777,61 @@ def main():
         _flush_trigger_over_idle()
 
 def _respawn(extra):  # a crashed sibling (e.g. subconscious) must not stay silently dead
-    while True:
-        p = subprocess.Popen([sys.executable, __file__, extra])
+    while not _shutdown.is_set():
+        with _children_lock:
+            if _shutdown.is_set():
+                return
+            p = subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), extra], stdin=subprocess.DEVNULL)
+            _children.add(p)
         p.wait()
+        with _children_lock:
+            _children.discard(p)
+        if _shutdown.is_set():
+            return
+        if p.returncode == 78:
+            life(f"[child {extra} exited 78; not restarting — fix its configuration]")
+            return
         life(f"[child {extra} exited {p.returncode}; respawn in 10s]")
-        time.sleep(10)
+        _shutdown.wait(10)
+
+
+def _stop_children():
+    _shutdown.set()
+    with _children_lock:
+        children = list(_children)
+    for child in children:
+        if child.poll() is None:
+            try: child.terminate()
+            except ProcessLookupError: pass
+    for child in children:
+        try: child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+def _handle_signal(signum, frame):
+    _shutdown.set()
+    raise SystemExit(128 + signum)
+
+
+def run():
+    pathlib.Path(AGENT_DIR).mkdir(parents=True, exist_ok=True)
+    with open(f"{AGENT_DIR}/.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"{AGENT_DIR} is already running", file=sys.stderr)
+            sys.exit(78)
+        os.makedirs(BLOB_DIR, exist_ok=True)
+        os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+        try:
+            main()
+        finally:
+            _stop_children()
+
 
 if __name__ == "__main__":
-    for extra in sys.argv[2:]:  # extra agent dirs each get their own process
-        threading.Thread(target=_respawn, args=(extra,), daemon=True, name=f"respawn-{extra}").start()
-    main()
+    run()

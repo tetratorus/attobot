@@ -7,7 +7,6 @@ Reads from agent.CFG:
   max_tokens          defaults to 4096
 """
 import json
-import sys
 
 import requests
 
@@ -43,10 +42,8 @@ def chat(messages, tools):
         json=body,
         timeout=600,  # long reasoning generations exceed 120s; timing out mid-generation = retry forever
     )
-    data = r.json()
+    data = agent.llm_response(r)  # bad key/model/request — retrying won't help
     if "content" not in data:
-        if 400 <= r.status_code < 500 and r.status_code != 429:
-            sys.exit(f"fatal llm error {r.status_code}: {data}")  # bad key/model/request — retrying won't help
         raise RuntimeError(f"{r.status_code}: {data}")
     return _convert_response(data)
 

@@ -102,7 +102,7 @@ Built fresh every turn:
 
 The last `life_tail` lines of LIFE.md (prefixed with `[N bytes earlier]`) are not part of the system prompt — they ride along as a trailing `<system-message>` user message after the conversation, rebuilt every turn.
 
-The agent sees its own harness. Modify `agent.py` and the agent's self-model updates next turn.
+The agent sees its own harness. The source is memoized at first read — modify `agent.py` and the self-model updates on restart.
 
 ## Memory pressure
 
