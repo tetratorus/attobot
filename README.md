@@ -28,6 +28,12 @@ Three daemon threads append to `messages.jsonl`:
 - **triggers** — `start_triggers()` scans `agent/triggers/*.json` every 30s; due ones append `{role:user, content:"<system-message>[trigger <name>] …</system-message>"}`. Three kinds: a **cron** — `{"next": <ts>, "repeat_s": <s?>, "message": "…"}` — fires on the clock (repeating ones reschedule, one-shots delete); a **watch** — `{"watch": "<path>", "repeat_s": <cooldown?>, "message": "…"}` — fires when the file's content changes; a **cmd** — `{"cmd": "<shell>", "repeat_s": <s?>}` — runs the command (60s timeout) and fires with its stdout (clipped), no output = no fire. Combined with `watch`, the cmd runs when the file changes but receives no stdin; commands that need context should read files themselves. Fires are queued and injected one at a time, only when the stream is idle (last line is a plain assistant reply, no tool_calls in flight); if the previous trigger got only an idle text reply, that pair is collapsed before the next one lands, so unactioned triggers don't pile up. Triggers named `subconscious-*` are additionally surfaced to the operator's Telegram.
 - **mail** — `start_inbox()` polls `agent/mail_inbox/`. New files append `{role:user, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
 
+Fired triggers are persisted in `agent/trigger-queue/` before one-shot schedules
+are removed. Conversation rewrites use a private recovery journal alongside
+`messages.jsonl`, keeping the existing file lock and inode; the next harness read
+or write completes an interrupted rewrite before proceeding. Delivery is
+at-least-once across interruptions, not an exactly-once guarantee for tool actions.
+
 There is no mid-stream `role:system` — the only system message in a request is the system prompt itself. System-ish injections (triggers, bg completions, stash markers, the start banner) are user messages wrapped in `<system-message>…</system-message>`; the harness strips the wrapper when checking prefixes.
 
 ## Channel out
@@ -211,6 +217,18 @@ Default: `deepseek-v4-pro` via `https://api.deepseek.com/v1`. Override `model` /
 ```
 
 Tunables with defaults in `CFG` (rarely worth changing, override in `config.json`): `life_tail`, `memory_limit`, `tool_timeout`, `trigger_tick`, `inbox_tick`, `inbox_preview`, `chat_msg_max`, `tool_output_limit`. `AGENT_DIR` / `BLOB_DIR` are in-source constants.
+
+## Verification
+
+Run the local regression suite from this checkout:
+
+```sh
+python3 -m unittest test_agent -v
+```
+
+It covers the local chat adapter, trigger persistence, interrupted conversation
+rewrite recovery, and concurrent message writers. The live-model test is skipped
+unless `ATTOBOT_LIVE_URL` points to an explicitly configured isolated lab.
 
 ## Principles
 

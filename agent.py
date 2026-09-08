@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, re, requests, shutil, signal, subprocess, sys, threading, time
+import base64, contextlib, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, re, requests, shutil, signal, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
@@ -54,11 +54,48 @@ def _msg(line):
     except Exception: return {}
     return m if isinstance(m, dict) else {}
 
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def _recover_messages(file):
+    journal = pathlib.Path(file.name).with_name('.' + pathlib.Path(file.name).name + '.rewrite')
+    if journal.exists():
+        content = journal.read_text()
+        file.seek(0); file.truncate()
+        file.write(content)
+        file.flush()
+        os.fsync(file.fileno())
+        journal.unlink()
+        _sync_directory(journal.parent)
+        file.seek(0)
+
+@contextlib.contextmanager
+def _message_file(path, mode='r+'):
+    with open(path, mode) as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        _recover_messages(file)
+        yield file
+
+def _rewrite_messages(file, content):
+    journal = pathlib.Path(file.name).with_name('.' + pathlib.Path(file.name).name + '.rewrite')
+    temporary = journal.with_name(journal.name + '.' + os.urandom(8).hex() + '.tmp')
+    with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(journal)
+    _sync_directory(journal.parent)
+    _recover_messages(file)
+
 def load_messages(): # Loads and heals messages.jsonl by dropping malformed lines and invalid tool-call blocks.
-    with open(f"{AGENT_DIR}/messages.jsonl", "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with _message_file(f"{AGENT_DIR}/messages.jsonl") as f:
+        content = f.read()
         msgs = []
-        for line in f.read().splitlines():
+        for line in content.splitlines():
             try:
                 m = json.loads(line)
             except json.JSONDecodeError:
@@ -87,8 +124,9 @@ def load_messages(): # Loads and heals messages.jsonl by dropping malformed line
             if need and len(set(need)) == len(need) and len(got) == len(need) and all(cid in got for cid in need):
                 out.extend(msgs[i:j])
             i = j
-        f.seek(0); f.truncate()
-        f.write("".join(json.dumps(m) + "\n" for m in out))
+        healed = "".join(json.dumps(m) + "\n" for m in out)
+        if healed != content:
+            _rewrite_messages(f, healed)
         return out
 
 def _msg_summary(m):
@@ -106,10 +144,11 @@ def _msg_summary(m):
 
 def append_msg(m, agent_dir=AGENT_DIR):
     msgs = m if isinstance(m, list) else [m]
-    with open(f"{agent_dir}/messages.jsonl", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with _message_file(f"{agent_dir}/messages.jsonl", "a") as f:
         for msg in msgs:
             f.write(json.dumps(msg) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     for msg in msgs:
         life(_msg_summary(msg), agent_dir)
 
@@ -269,8 +308,7 @@ def web_fetch(args):
 def stash_messages(args):
     path = args.get("path") or f"{AGENT_DIR}/messages.jsonl"
 
-    with open(path) as f:
-        fcntl.flock(f, fcntl.LOCK_SH)
+    with _message_file(path) as f:
         lines = f.read().splitlines()
     n = len(lines)
 
@@ -308,13 +346,11 @@ def stash_messages(args):
     if len(placeholder) >= len(target):
         return "nothing safe to stash: replacement would not reduce context"
 
-    with open(path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with _message_file(path) as f:
         current = f.read().splitlines()
         if current[:n] != lines:
             return "stash failed because target range no longer in file (file was modified)"
-        f.seek(0); f.truncate()
-        f.write("\n".join(current[:s] + [placeholder] + current[e:]) + "\n")
+        _rewrite_messages(f, "\n".join(current[:s] + [placeholder] + current[e:]) + "\n")
     return f"{count} lines stashed to {marker}"
 
 TOOLS = [
@@ -465,27 +501,40 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
-_trigger_queue = collections.deque()
 _trigger_queue_lock = threading.Lock()
+
+def _queue_trigger(message):
+    directory = pathlib.Path(AGENT_DIR) / "trigger-queue"
+    directory.mkdir(exist_ok=True)
+    _sync_directory(directory.parent)
+    path = directory / f"{time.time_ns():020d}-{os.urandom(8).hex()}.json"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("x") as file:
+        json.dump(message, file)
+        file.flush()
+        os.fsync(file.fileno())
+    temporary.replace(path)
+    _sync_directory(directory)
 
 def _flush_trigger_over_idle():
     path = f"{AGENT_DIR}/messages.jsonl"
     try:
-        with open(path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+        with _message_file(path) as f:
             lines = f.read().splitlines()
             last = _msg(lines[-1]) if lines else {}
             if lines and (last.get("role") != "assistant" or last.get("tool_calls")):
                 return
             with _trigger_queue_lock:
-                if not _trigger_queue:
+                pending = next(iter(sorted((pathlib.Path(AGENT_DIR) / "trigger-queue").glob("*.json"))), None)
+                if pending is None:
                     return
-                m = _trigger_queue.popleft()
-            if len(lines) >= 2 and _unwrap_sys_msg(_msg(lines[-2]).get("content") or "").startswith("[trigger "):
-                lines = lines[:-2]
-            lines.append(json.dumps(m))
-            f.seek(0); f.truncate()
-            f.write("\n".join(lines) + "\n")
+                m = json.loads(pending.read_text())
+                if len(lines) >= 2 and _unwrap_sys_msg(_msg(lines[-2]).get("content") or "").startswith("[trigger "):
+                    lines = lines[:-2]
+                lines.append(json.dumps(m))
+                _rewrite_messages(f, "\n".join(lines) + "\n")
+                pending.unlink()
+                _sync_directory(pending.parent)
     except FileNotFoundError:
         return
     life(_msg_summary(m))
@@ -522,17 +571,17 @@ def start_triggers():
                             f.write_text(json.dumps(job))
                             continue
                     one_shot = not (job.get("repeat_s") or job.get("watch"))
-                    if not one_shot:
-                        if job.get("repeat_s"):
-                            job["next"] = ts + job["repeat_s"]
-                        f.write_text(json.dumps(job))
                     content = f"[trigger {f.stem}] {msg}"
+                    with _trigger_queue_lock:
+                        _queue_trigger({"role": "user", "content": f"<system-message>{content}</system-message>"})
+                        if one_shot:
+                            f.unlink()
+                        else:
+                            if job.get("repeat_s"):
+                                job["next"] = ts + job["repeat_s"]
+                            f.write_text(json.dumps(job))
                     if f.stem.startswith("subconscious-"):  # subconscious has no channel of its own; surface its triggers to Telegram via the primary
                         send_text(content)
-                    with _trigger_queue_lock:
-                        _trigger_queue.append({"role": "user", "content": f"<system-message>{content}</system-message>"})
-                    if one_shot:
-                        f.unlink()
             except Exception as e:
                 life(f"[trigger error] {e}")  # log only, don't wake
             _flush_trigger_over_idle()
@@ -584,12 +633,10 @@ def _stash_directive_arg(content):
 
 def _exec_stash_directive(arg):
     path = f"{AGENT_DIR}/messages.jsonl"
-    with open(path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with _message_file(path) as f:
         msgs = [json.loads(ln) for ln in f.read().splitlines()]
         kept = [m for m in msgs if not (m.get("role") == "user" and _stash_directive_arg(m.get("content") or "") is not None)]
-        f.seek(0); f.truncate()
-        f.write("".join(json.dumps(m) + "\n" for m in kept))
+        _rewrite_messages(f, "".join(json.dumps(m) + "\n" for m in kept))
         n = len(kept)
     p = arg.split() if arg else []
     if arg == "all" and n > 1:
