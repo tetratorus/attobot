@@ -88,11 +88,19 @@ def normalize_request(body):
 
 def chat(messages, tools):
     import agent
-    response = requests.post(f"{agent.CFG['api_base'].rstrip('/')}/{ENDPOINT}",
-                             headers={"Authorization": f"Bearer {agent.CFG['api_key']}"},
-                             json=build_request(messages, tools, agent.CFG), timeout=600)
-    data = agent.llm_response(response)
-    try:
-        return parse_response(data)
-    except ValueError as error:
-        raise agent.FatalLLMError(400, str(error)) from error
+    body = build_request(messages, tools, agent.CFG)
+    limit = max(body['max_output_tokens'], int(agent.CFG.get('max_tokens_limit', 32768)))
+    for attempt in range(3):
+        response = requests.post(f"{agent.CFG['api_base'].rstrip('/')}/{ENDPOINT}",
+                                 headers={"Authorization": f"Bearer {agent.CFG['api_key']}"},
+                                 json=body, timeout=600)
+        data = agent.llm_response(response)
+        if data.get('status') == 'incomplete' and (data.get('incomplete_details') or {}).get('reason') == 'max_output_tokens':
+            if attempt == 2 or body['max_output_tokens'] >= limit:
+                raise agent.GenerationLimitError(f"Responses exhausted the output budget after {attempt + 1} attempts ({body['max_output_tokens']} tokens)")
+            body = {**body, 'max_output_tokens': min(limit, body['max_output_tokens'] * 2)}
+            continue
+        try:
+            return parse_response(data)
+        except ValueError as error:
+            raise agent.FatalLLMError(400, str(error)) from error

@@ -152,6 +152,10 @@ def append_msg(m, agent_dir=AGENT_DIR):
     for msg in msgs:
         life(_msg_summary(msg), agent_dir)
 
+class GenerationLimitError(RuntimeError):
+    pass
+
+
 class FatalLLMError(SystemExit):
     def __init__(self, status, data):
         super().__init__(78)
@@ -203,6 +207,8 @@ def llm_w_retry(messages, tools=None):
     while True:
         try:
             return llm(messages, tools)
+        except GenerationLimitError:
+            raise
         except Exception as e:
             life(f"[llm retry in {delay}s] {e}")
             time.sleep(delay)
@@ -764,6 +770,11 @@ def main():
             msg = llm_w_retry(
                 [{"role": "system", "content": system}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
                 tools=TOOL_SCHEMAS)
+        except GenerationLimitError as error:
+            life(f"[generation limit; waiting for new input] {error}")
+            last_hash = file_hash()
+            owe_turn = load_messages() != messages
+            continue
         except SystemExit as e:
             # a context-window 4xx would otherwise crash-loop forever under Restart=always
             # (the char-estimate overflow check never trips when config context_tokens > the model's real window)

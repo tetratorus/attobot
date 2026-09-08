@@ -218,12 +218,18 @@ Default: `deepseek-v4-pro` via `https://api.deepseek.com/v1`. Override `model` /
 
 Tunables with defaults in `CFG` (rarely worth changing, override in `config.json`): `life_tail`, `memory_limit`, `tool_timeout`, `trigger_tick`, `inbox_tick`, `inbox_preview`, `chat_msg_max`, `tool_output_limit`. `AGENT_DIR` / `BLOB_DIR` are in-source constants.
 
+The Responses provider allows at most three generation attempts, doubling
+the per-request budget up to `max_tokens_limit` (default 32768, or the initial
+budget if higher). It never executes incomplete tool calls. If that recovery is
+exhausted, the employee stays alive, logs the limit, and waits for new input
+instead of retrying indefinitely or exiting with a permanent configuration error.
+
 ## Verification
 
 Run the local regression suite from this checkout:
 
 ```sh
-python3 -m unittest test_agent -v
+python3 -m unittest test_agent test_responses -v
 ```
 
 It covers the local chat adapter, trigger persistence, interrupted conversation
