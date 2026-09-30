@@ -71,7 +71,7 @@ The bg json holds the pid so the agent can kill a runaway task itself. Backgroun
 ## State
 
 ```
-SOUL.md                       # the prompt template (copied into agent/ by setup.py)
+SOUL.md                       # the prompt template for agent/SOUL.md
 agent.py                      # the harness, included verbatim in the system prompt
 opt/
   tools/<name>.py             # optional capability tools (see Optional add-ons)
@@ -139,12 +139,17 @@ Each entry copies `opt/<path>.py` → `agent/<path>.py` at first boot. From then
 
 A second attobot that reviews the first. Same harness, different soul (`opt/subconscious/` — an agent-dir skeleton: soul + a pre-seeded watch job), no chat. It runs in the same unix user as the primary — it needs direct read/write into `agent/` — unlike peer agents, which get a user each.
 
-```bash
-python setup.py --subconscious ...   # copies opt/subconscious/ out beside agent/, reuses the api_key
-python agent.py agent subconscious   # one command, one process per dir
-```
+The sibling directory needs its own `config.json` with the provider settings and
+`"opt": ["tools/nudge", "tools/stash_messages"]`. These entries install the tools
+required by its soul. The supplied triggers assume `agent/` and `subconscious/`
+under the working directory; custom layouts need corresponding trigger paths and
+`primary_dir` in the subconscious config. Attosys provisions the standard layout.
 
-For an existing install: `cp -r opt/subconscious . && echo '{"api_key": "sk-...", "opt": ["tools/nudge", "tools/stash_messages"]}' > subconscious/config.json` (the `opt` entries copy NUDGE/PRUNE into `subconscious/tools/` at first boot — the subconscious SOUL depends on them; `setup.py --subconscious` writes the same config).
+Run both configured directories with:
+
+```bash
+python agent.py agent subconscious
+```
 
 A pre-seeded `selfwipe.json` trigger stashes the subconscious's own `messages.jsonl` to a single pointer every ~30min (only when it has grown past 20 lines) — the self-wipe its SOUL describes.
 
@@ -157,54 +162,38 @@ Both act through the trigger-file bus — the subconscious never writes the prim
 
 ## Run
 
-```
+Attobot runs a configured agent directory. Attosys handles company provisioning,
+Unix accounts, services, and deployment.
+
+Before starting, the state directory must contain `config.json` (a JSON object)
+and `SOUL.md` (use the root template or your own prompt). Supply the LLM key through
+`ATTOBOT_API_KEY` or the config's `api_key` field; the environment takes precedence.
+Keep configurations containing credentials private (mode `600`).
+
+```sh
 pip install -r requirements.txt
-python setup.py                            # prompts for token, auto-discovers chat_id, prompts for api_key
-python agent.py
+python agent.py agent
 ```
 
-`setup.py` accepts CLI args for non-interactive use (e.g. an HR-style agent spawning new agents):
+`python agent.py [agent_dir ...]` defaults to `./agent`. Extra directories each get
+their own process; Ctrl-C stops them all. A child that dies is respawned after 10s
+and the death is logged to the primary's LIFE.
 
-```
-python setup.py --token 123:abc --chat -1001234567 --api-key sk-... [--thread 42] [--systemd]
-```
+The default model is `deepseek-v4-pro`. Override `model` / `api_base` in the config
+for an OpenAI-compatible endpoint, or select an adapter with `provider`.
 
-Required config (`agent/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
+Omit `telegram_token` for a chat-less agent. For Telegram, configure the token and
+chat ID, plus a thread ID if needed. The bot must be allowed to join groups and
+have privacy mode disabled to receive all group messages.
 
-## Deploy
-
-One agent per unix user: give the agent its own user, clone this repo into their `$HOME`, run `setup.py` and `agent.py` from there. The agent owns its copy of the harness; editing it affects no other agent.
-
-On macOS or for quick testing, just run `python agent.py` (use `tmux` to keep it alive across logout).
-
-On Linux, run `setup.py --systemd` as the dedicated user to emit a systemd unit + install instructions:
-
-```bash
-python setup.py --systemd
-# wrote agent/config.json
-# wrote attobot.service
-#
-# Install (user service, no sudo):
-#   mkdir -p ~/.config/systemd/user
-#   cp attobot.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   loginctl enable-linger $USER          # so it survives logout
-#   systemctl --user enable --now attobot
-#   journalctl --user -u attobot -f
-```
-
-Default: `deepseek-v4-pro` via `https://api.deepseek.com/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
-
-`python agent.py [agent_dir ...]` — the arg is the agent state folder (default `./agent`); same optional arg on `setup.py`. It must hold `config.json` and `SOUL.md` (`setup.py` creates both). Extra dirs each get their own process (`python agent.py agent subconscious` runs the pair; ctrl-C kills both; a child that dies is respawned after 10s and the death is logged to the primary's LIFE).
-
-`agent/config.json` fields (only `api_key` is required — omit `telegram_token` for a chat-less agent; the rest fall back to sensible defaults baked into `agent.py`):
+`agent/config.json` fields (defaults live in `agent.py`):
 
 ```jsonc
 {
   "telegram_token": "...",         // optional — omit for no chat channel
   "telegram_chat_id": "...",       // required if telegram_token is set
   "telegram_thread_id": "...",     // optional, forum supergroup topic
-  "api_key": "...",                // required, LLM provider key
+  "api_key": "...",                // optional when ATTOBOT_API_KEY is set
   "model": "deepseek-v4-pro",
   "api_base": "https://api.deepseek.com/v1",
   "temperature": 1.0,
@@ -232,9 +221,9 @@ Run the local regression suite from this checkout:
 python3 -m unittest test_agent test_responses -v
 ```
 
-It covers the local chat adapter, trigger persistence, interrupted conversation
-rewrite recovery, and concurrent message writers. The live-model test is skipped
-unless `ATTOBOT_LIVE_URL` points to an explicitly configured isolated lab.
+It covers trigger persistence, interrupted conversation rewrite recovery,
+concurrent message writers, startup validation, process locking, web fetching,
+and provider output-limit recovery. It makes no live model calls.
 
 ## Principles
 

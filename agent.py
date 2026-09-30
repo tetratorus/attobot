@@ -692,7 +692,7 @@ def fatal(message):
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
     if not config_path.exists():
-        fatal(f"missing {config_path}. Run: python setup.py")
+        fatal(f"missing {config_path} — provide config.json and SOUL.md before starting")
     if not pathlib.Path(f"{AGENT_DIR}/SOUL.md").exists():
         fatal(f"missing {AGENT_DIR}/SOUL.md — copy a soul template in")
     try:
